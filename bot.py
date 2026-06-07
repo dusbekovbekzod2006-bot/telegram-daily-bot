@@ -3,6 +3,8 @@ import json
 import os
 from datetime import datetime, timedelta
 import pytz
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -10,226 +12,232 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("TOKEN", "")
-DATA_FILE = "tasks.json"
 TIMEZONE = "Asia/Tashkent"
 WAITING_TASK = 1
+
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS", "")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def load_tasks():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def get_sheets_client():
+    if not GOOGLE_CREDENTIALS_JSON:
+        logger.warning("GOOGLE_CREDENTIALS not set")
+        return None
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        logger.error(f"Sheets client error: {e}")
+        return None
 
 
-def save_tasks(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def get_sheet():
+    client = get_sheets_client()
+    if not client or not SPREADSHEET_ID:
+        return None
+    try:
+        return client.open_by_key(SPREADSHEET_ID).sheet1
+    except Exception as e:
+        logger.error(f"Get sheet error: {e}")
+        return None
 
 
-def get_user_tasks(user_id):
-    return load_tasks().get(str(user_id), [])
+def sheet_add_task(user_id, username, task_text):
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return False
+        tz = pytz.timezone(TIMEZONE)
+        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        sheet.append_row([str(user_id), username or "", task_text, now, "active", ""])
+        return True
+    except Exception as e:
+        logger.error(f"sheet_add_task error: {e}")
+        return False
 
 
-def save_user_tasks(user_id, tasks):
-    data = load_tasks()
-    data[str(user_id)] = tasks
-    save_tasks(data)
+def sheet_get_tasks(user_id):
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return {}
+        all_rows = sheet.get_all_records()
+        tasks = {}
+        for i, row in enumerate(all_rows):
+            if str(row.get("User ID", "")) == str(user_id) and row.get("Status", "") == "active":
+                task_key = str(i)
+                tasks[task_key] = {
+                    "task": row.get("Task", ""),
+                    "date": row.get("Date Added", ""),
+                    "row_index": i + 2
+                }
+        return tasks
+    except Exception as e:
+        logger.error(f"sheet_get_tasks error: {e}")
+        return {}
 
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Ish qoshish", callback_data="add_task")],
-        [InlineKeyboardButton("Ishlarim royxati", callback_data="list_tasks")],
-        [InlineKeyboardButton("Bajarilganlar", callback_data="done_tasks")],
-        [InlineKeyboardButton("Hammasini ochirish", callback_data="clear_tasks")],
-        [InlineKeyboardButton("Yordam", callback_data="help")],
-    ])
+def sheet_complete_task(user_id, row_index):
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return False
+        tz = pytz.timezone(TIMEZONE)
+        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
+        sheet.update_cell(row_index, 5, "done")
+        sheet.update_cell(row_index, 6, now)
+        return True
+    except Exception as e:
+        logger.error(f"sheet_complete_task error: {e}")
+        return False
+
+
+def sheet_delete_task(user_id, row_index):
+    try:
+        sheet = get_sheet()
+        if sheet is None:
+            return False
+        sheet.delete_rows(row_index)
+        return True
+    except Exception as e:
+        logger.error(f"sheet_delete_task error: {e}")
+        return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Vazifalar ro'yxati", callback_data="list_tasks")],
+        [InlineKeyboardButton("Yangi vazifa qo'shish", callback_data="add_task")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Salom, {update.effective_user.first_name}!\nMen kundalik ishlar botingizman!\nMenyudan foydalaning:",
-        reply_markup=main_menu_keyboard()
-    )
-
-
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "Buyruqlar:\n/start\n/menu\n/add - Ish qoshish\n/list - Royxat\n\nFormat: HH:MM Ish nomi\nMasalan: 09:00 Email"
-    target = update.message or update.callback_query.message
-    await target.reply_text(text)
-
-
-async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "Yangi ish:\nHH:MM Ish nomi\nMasalan: 09:00 Email\n\n/cancel - bekor"
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text(msg)
-    else:
-        await update.message.reply_text(msg)
-    return WAITING_TASK
-
-
-async def receive_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.startswith("/"):
-        await update.message.reply_text("Bekor qilindi. /menu")
-        return ConversationHandler.END
-    parts = text.split(" ", 1)
-    if len(parts) < 2:
-        await update.message.reply_text("Format: HH:MM Ish nomi")
-        return WAITING_TASK
-    time_str, task_name = parts
-    try:
-        hour, minute = map(int, time_str.split(":"))
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-    except Exception:
-        await update.message.reply_text("Vaqt notogri! Masalan: 09:00")
-        return WAITING_TASK
-    user_id = str(update.effective_user.id)
-    tasks = get_user_tasks(user_id)
-    task = {"id": len(tasks) + 1, "name": task_name, "time": f"{hour:02d}:{minute:02d}", "done": False}
-    tasks.append(task)
-    save_user_tasks(user_id, tasks)
-    tz = pytz.timezone(TIMEZONE)
-    now = datetime.now(tz)
-    remind_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if remind_time <= now:
-        remind_time += timedelta(days=1)
-    context.job_queue.run_daily(
-        send_reminder,
-        time=remind_time.timetz(),
-        days=tuple(range(7)),
-        chat_id=update.effective_chat.id,
-        name=f"task_{user_id}_{task['id']}",
-        data={"task_name": task_name, "task_id": task["id"], "user_id": user_id}
-    )
-    await update.message.reply_text(f"Qoshildi! {task_name} - {hour:02d}:{minute:02d}\n\n/menu")
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bekor qilindi. /menu")
-    return ConversationHandler.END
-
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    data = job.data
-    keyboard = [[
-        InlineKeyboardButton("Bajardim", callback_data=f"mark_done_{data['task_id']}"),
-        InlineKeyboardButton("30 daqiqadan keyin", callback_data=f"snooze_{data['task_id']}")
-    ]]
-    await context.bot.send_message(
-        chat_id=job.chat_id,
-        text=f"ESLATMA!\n\n{data['task_name']}\n\nVaqti keldi!",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "Salom! Men vazifalar botiman.\n\nNima qilishni xohlaysiz?",
+        reply_markup=reply_markup
     )
 
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = str(update.effective_user.id)
-    if query:
-        await query.answer()
-    tasks = get_user_tasks(user_id)
+    await query.answer()
+    user_id = query.from_user.id
+    tasks = sheet_get_tasks(user_id)
     if not tasks:
-        text = "Ishlar yoq. /add"
-    else:
-        active = [t for t in tasks if not t.get("done")]
-        done_list = [t for t in tasks if t.get("done")]
-        text = "Ishlaringiz:\n"
-        if active:
-            text += "\nBajarilmagan:\n" + "".join(f"  {t['time']} - {t['name']}\n" for t in active)
-        if done_list:
-            text += "\nBajarilgan:\n" + "".join(f"  {t['time']} - {t['name']} v\n" for t in done_list)
-        text += f"\nJami: {len(tasks)}"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Ish qoshish", callback_data="add_task"),
-        InlineKeyboardButton("Menyu", callback_data="back_main")
-    ]])
-    target = query.message if query else update.message
-    await target.reply_text(text, reply_markup=kb)
+        keyboard = [[InlineKeyboardButton("Ortga", callback_data="back_main")]]
+        await query.edit_message_text(
+            "Hozircha vazifalar yo'q.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    keyboard = []
+    for key, task_info in tasks.items():
+        task_text = task_info["task"]
+        row_index = task_info["row_index"]
+        short = task_text[:30] + "..." if len(task_text) > 30 else task_text
+        keyboard.append([
+            InlineKeyboardButton(f"✅ {short}", callback_data=f"done_{row_index}"),
+            InlineKeyboardButton("🗑", callback_data=f"del_{row_index}")
+        ])
+    keyboard.append([InlineKeyboardButton("Ortga", callback_data="back_main")])
+    msg = "Sizning vazifalaringiz:\n"
+    for key, task_info in tasks.items():
+        msg += f"- {task_info['task']} ({task_info['date']})\n"
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    user_id = str(update.effective_user.id)
-    if data == "add_task":
-        await add_task_start(update, context)
-    elif data == "list_tasks":
-        await list_tasks(update, context)
-    elif data == "done_tasks":
-        tasks = get_user_tasks(user_id)
-        done = [t for t in tasks if t.get("done")]
-        text = "Bajarilgan:\n" + "".join(f"  {t['time']} - {t['name']}\n" for t in done) if done else "Hali yoq."
-        await query.message.reply_text(text)
-    elif data == "clear_tasks":
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Ha, ochir", callback_data="confirm_clear"),
-            InlineKeyboardButton("Yoq", callback_data="back_main")
-        ]])
-        await query.message.reply_text("Hammasini ochirsinmi?", reply_markup=kb)
-    elif data == "confirm_clear":
-        save_user_tasks(user_id, [])
-        await query.message.reply_text("Ochirildi!", reply_markup=main_menu_keyboard())
-    elif data == "help":
-        await help_command(update, context)
-    elif data == "back_main":
-        await query.message.reply_text("Asosiy menyu:", reply_markup=main_menu_keyboard())
-    elif data.startswith("mark_done_"):
-        task_id = int(data.split("_")[-1])
-        tasks = get_user_tasks(user_id)
-        for t in tasks:
-            if t["id"] == task_id:
-                t["done"] = True
-        save_user_tasks(user_id, tasks)
-        await query.edit_message_text("Bajarildi!")
-    elif data.startswith("snooze_"):
-        task_id = int(data.split("_")[-1])
-        tasks = get_user_tasks(user_id)
-        task_name = next((t["name"] for t in tasks if t["id"] == task_id), "")
-        context.job_queue.run_once(
-            send_reminder, when=1800, chat_id=query.message.chat_id,
-            data={"task_name": task_name, "task_id": task_id, "user_id": user_id}
-        )
-        await query.edit_message_text(f"30 daqiqadan keyin! {task_name}")
+    await query.edit_message_text("Yangi vazifani yozing:")
+    return WAITING_TASK
+
+
+async def add_task_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task_text = update.message.text.strip()
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or update.message.from_user.first_name or ""
+    success = sheet_add_task(user_id, username, task_text)
+    if success:
+        await update.message.reply_text(f"Vazifa qo'shildi: {task_text}")
+    else:
+        await update.message.reply_text("Xatolik yuz berdi. Iltimos qaytadan urinib ko'ring.")
+    keyboard = [
+        [InlineKeyboardButton("Vazifalar ro'yxati", callback_data="list_tasks")],
+        [InlineKeyboardButton("Yangi vazifa qo'shish", callback_data="add_task")],
+    ]
+    await update.message.reply_text("Boshqa nima qilishni xohlaysiz?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return ConversationHandler.END
+
+
+async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    row_index = int(query.data.split("_")[1])
+    user_id = query.from_user.id
+    success = sheet_complete_task(user_id, row_index)
+    if success:
+        await query.answer("Vazifa bajarildi!", show_alert=True)
+    else:
+        await query.answer("Xatolik!", show_alert=True)
+    await list_tasks(update, context)
+
+
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    row_index = int(query.data.split("_")[1])
+    user_id = query.from_user.id
+    success = sheet_delete_task(user_id, row_index)
+    if success:
+        await query.answer("Vazifa o'chirildi!", show_alert=True)
+    else:
+        await query.answer("Xatolik!", show_alert=True)
+    await list_tasks(update, context)
+
+
+async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("Vazifalar ro'yxati", callback_data="list_tasks")],
+        [InlineKeyboardButton("Yangi vazifa qo'shish", callback_data="add_task")],
+    ]
+    await query.edit_message_text("Nima qilishni xohlaysiz?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bekor qilindi.")
+    return ConversationHandler.END
 
 
 def main():
-    if not TOKEN:
-        logger.error("TOKEN topilmadi!")
-        return
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("add", add_task_start),
-            CallbackQueryHandler(add_task_start, pattern="^add_task$")
-        ],
-        states={WAITING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_task)]},
+    application = Application.builder().token(TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_task_start, pattern="^add_task$")],
+        states={
+            WAITING_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_receive)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_chat=True,
-        per_user=True,
-        per_message=False
     )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("list", list_tasks))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot ishga tushdi!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(list_tasks, pattern="^list_tasks$"))
+    application.add_handler(CallbackQueryHandler(complete_task, pattern="^done_"))
+    application.add_handler(CallbackQueryHandler(delete_task, pattern="^del_"))
+    application.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
+
+    logger.info("Bot ishga tushdi...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
